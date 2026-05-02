@@ -18,6 +18,7 @@
 #include "blocked_bloom_filter_uint64.h"
 #include "bloom_filter_uint64.h"
 #include "dynamic_pgm_index.h"
+#include "fast_membership_filter_uint64.h"
 #include "lipp.h"
 
 /**
@@ -82,15 +83,19 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
 
   static constexpr double k_bloom_fp = 0.01;
   static constexpr double k_prefilter_fp = 0.05;
+  static constexpr size_t kOwnerMaxSize = size_t{2147483648};
+  static constexpr size_t kLocalFlushThreshold = size_t{128} * 1024 * 1024;
+  static constexpr double kBaseFilterBitsPerKey = 16.0;
+  static constexpr double kOverlayFilterBitsPerKey = 4.0;
   static constexpr size_t kBaseDrainBudget = 4;
-  static constexpr size_t kActiveCapDefault = size_t{4} * 1024 * 1024;
+  static constexpr size_t kActiveCapDefault = kLocalFlushThreshold;
   static constexpr size_t kAbsoluteCapMin = 1024;
-  static constexpr size_t kAbsoluteCapMax = size_t{8} * 1024 * 1024;
+  static constexpr size_t kAbsoluteCapMax = kLocalFlushThreshold;
   static constexpr size_t kRebuildEveryDrains = (size_t{1} << 30);
   // (C) Global LIPP-membership prefilter on/off. Patched by
   // scripts/run_prefilter_ab.sh; preserve name and the literal "true"/"false"
   // value so the sed-flip script can find it.
-  static constexpr bool kEnablePrefilter = true;
+  static constexpr bool kEnablePrefilter = false;
   // (E) Worker batches LIPP inserts under lipp_mtx_ to amortize lock cost
   // and minimize lookup-side contention.
   static constexpr size_t kWorkerBatchSize = 256;
@@ -119,7 +124,9 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   enum class Mode : uint8_t { kUnknown, kLookupHeavy, kInsertHeavy };
   static constexpr size_t kWarmupOps = 16384;
   static constexpr double kInsertHeavyThresholdPct = 0.50;
-  static constexpr size_t kLookupHeavyActiveCap = size_t{64} * 1024;
+  static constexpr size_t kLookupHeavyActiveCap = kActiveCapDefault;
+  static constexpr bool kLookupHeavyLane = pgm_error <= 64;
+  static constexpr bool kUseLippOverlay = kLookupHeavyLane;
   mutable size_t warmup_ops_ = 0;
   mutable size_t warmup_inserts_ = 0;
   mutable Mode mode_ = Mode::kUnknown;
@@ -129,20 +136,20 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   int permille_override_ = 0;
 
   PGM pgm_active_;
-  BloomFilterUint64 bloom_active_;
+  FastMembershipFilterUint64 bloom_active_;
   KeyType min_active_ = std::numeric_limits<KeyType>::max();
   KeyType max_active_ = std::numeric_limits<KeyType>::lowest();
   size_t active_size_ = 0;
 
   PGM pgm_frozen_;
-  BloomFilterUint64 bloom_frozen_;
+  FastMembershipFilterUint64 bloom_frozen_;
   KeyType min_frozen_ = std::numeric_limits<KeyType>::max();
   KeyType max_frozen_ = std::numeric_limits<KeyType>::lowest();
   size_t frozen_size_ = 0;
   std::vector<KeyValue<KeyType>> frozen_drain_;
   size_t frozen_drain_cursor_ = 0;
 
-  BlockedBloomFilterUint64 prefilter_;
+  FastMembershipFilterUint64 prefilter_;
 
   size_t drains_since_rebuild_ = 0;
 
@@ -174,6 +181,15 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     return bulk_size + headroom;
   }
 
+  size_t overlay_filter_capacity() const {
+    if constexpr (kUseLippOverlay) {
+      return size_t{2} * 1024 * 1024;
+    }
+    return std::max<size_t>(
+        size_t{2} * 1024 * 1024,
+        std::min<size_t>(active_cap_, size_t{4} * 1024 * 1024));
+  }
+
   // (F) Adaptive mode finalization. Foreground-only — must NOT be called
   // from a const method (it mutates active_cap_ and may trigger an immediate
   // rotation on the next Insert). Idempotent: returns early once mode_ is
@@ -202,7 +218,7 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   void reset_active() {
     pgm_active_ = PGM(params_);
     bloom_active_.clear();
-    bloom_active_.init(active_cap_ + 64, k_bloom_fp);
+    bloom_active_.init(overlay_filter_capacity(), kOverlayFilterBitsPerKey);
     min_active_ = std::numeric_limits<KeyType>::max();
     max_active_ = std::numeric_limits<KeyType>::lowest();
     active_size_ = 0;
@@ -341,12 +357,14 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
 
  public:
   Lipp<KeyType> lipp;
+  Lipp<KeyType> lipp_overlay;
 
   explicit HybridPGMLippAdv(const std::vector<int>& params)
       : params_(params),
         pgm_active_(params),
         pgm_frozen_(params),
-        lipp(params) {
+        lipp(params),
+        lipp_overlay(params) {
     if (params_.size() > 1) {
       const int p1 = params_[1];
       if (p1 > 1000) {
@@ -374,6 +392,10 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     active_cap_ = compute_active_cap(total_size_);
     reset_active();
     reset_frozen_empty();
+    if constexpr (kUseLippOverlay) {
+      const std::vector<KeyValue<KeyType>> empty;
+      lipp_overlay.Build(empty, num_threads);
+    }
     drains_since_rebuild_ = 0;
     // (F) Reset adaptive mode state per repeat. The harness reconstructs the
     // index per repeat anyway, but Build() is the canonical "fresh start"
@@ -384,7 +406,7 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
 
     prefilter_.clear();
     if (kEnablePrefilter) {
-      prefilter_.init(prefilter_capacity(total_size_), k_prefilter_fp);
+      prefilter_.init(prefilter_capacity(total_size_), kBaseFilterBitsPerKey);
       for (const auto& kv : data) {
         prefilter_.add(static_cast<uint64_t>(kv.key));
       }
@@ -408,35 +430,59 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     if (mode_ == Mode::kUnknown) {
       ++warmup_ops_;
     }
-    const bool maybe_in_lipp =
-        !kEnablePrefilter ||
-        prefilter_.maybe_contains(static_cast<uint64_t>(lookup_key));
-    if (maybe_in_lipp) {
-      // Skip the shared_lock when no drain is in flight: the worker is asleep
-      // on the cv and is not writing LIPP. drain_done_ uses acquire ordering
-      // so any worker writes prior to drain_done_=true are visible here.
-      const bool worker_idle =
-          drain_done_.load(std::memory_order_acquire);
-      size_t v;
-      if (worker_idle) {
-        v = lipp.EqualityLookup(lookup_key, thread_id);
-      } else {
-        std::shared_lock<std::shared_mutex> lk(lipp_mtx_);
-        v = lipp.EqualityLookup(lookup_key, thread_id);
-      }
+    // Both lanes use the bulk-loaded LIPP as the fast base path. The optional
+    // base-membership prefilter is left disabled in the final packaged run
+    // because it was slower than a direct LIPP probe on these traces.
+    bool maybe_in_base = true;
+    if constexpr (kEnablePrefilter) {
+      maybe_in_base = prefilter_.maybe_contains(static_cast<uint64_t>(lookup_key));
+    }
+    if (maybe_in_base) {
+      const size_t v = lipp.EqualityLookup(lookup_key, thread_id);
       if (v != util::NOT_FOUND) return v;
     }
-    if (active_size_ > 0 &&
-        lookup_key >= min_active_ && lookup_key <= max_active_ &&
-        bloom_active_.maybe_contains(static_cast<uint64_t>(lookup_key))) {
-      const size_t v = pgm_active_.EqualityLookup(lookup_key, thread_id);
-      if (v != util::OVERFLOW) return v;
-    }
-    if (frozen_size_ > 0 &&
-        lookup_key >= min_frozen_ && lookup_key <= max_frozen_ &&
-        bloom_frozen_.maybe_contains(static_cast<uint64_t>(lookup_key))) {
-      const size_t v = pgm_frozen_.EqualityLookup(lookup_key, thread_id);
-      if (v != util::OVERFLOW) return v;
+
+    if constexpr (kLookupHeavyLane) {
+      // Lookup-heavy lane: pay the Bloom-style overlay filter only after a
+      // base miss. This preserves miss filtering for negative lookups without
+      // adding a hash probe to the dominant base-hit path.
+      if (active_size_ > 0 &&
+          lookup_key >= min_active_ && lookup_key <= max_active_ &&
+          bloom_active_.maybe_contains(static_cast<uint64_t>(lookup_key))) {
+        size_t overlay_v;
+        if constexpr (kUseLippOverlay) {
+          overlay_v = lipp_overlay.EqualityLookup(lookup_key, thread_id);
+        } else {
+          overlay_v = pgm_active_.EqualityLookup(lookup_key, thread_id);
+        }
+        if (overlay_v != util::OVERFLOW) return overlay_v;
+      }
+      if (frozen_size_ > 0 &&
+          lookup_key >= min_frozen_ && lookup_key <= max_frozen_ &&
+          bloom_frozen_.maybe_contains(static_cast<uint64_t>(lookup_key))) {
+        const size_t overlay_v =
+            pgm_frozen_.EqualityLookup(lookup_key, thread_id);
+        if (overlay_v != util::OVERFLOW) return overlay_v;
+      }
+    } else {
+      if (active_size_ > 0 &&
+          lookup_key >= min_active_ && lookup_key <= max_active_ &&
+          bloom_active_.maybe_contains(static_cast<uint64_t>(lookup_key))) {
+        size_t overlay_v;
+        if constexpr (kUseLippOverlay) {
+          overlay_v = lipp_overlay.EqualityLookup(lookup_key, thread_id);
+        } else {
+          overlay_v = pgm_active_.EqualityLookup(lookup_key, thread_id);
+        }
+        if (overlay_v != util::OVERFLOW) return overlay_v;
+      }
+      if (frozen_size_ > 0 &&
+          lookup_key >= min_frozen_ && lookup_key <= max_frozen_ &&
+          bloom_frozen_.maybe_contains(static_cast<uint64_t>(lookup_key))) {
+        const size_t overlay_v =
+            pgm_frozen_.EqualityLookup(lookup_key, thread_id);
+        if (overlay_v != util::OVERFLOW) return overlay_v;
+      }
     }
     return util::NOT_FOUND;
   }
@@ -447,7 +493,11 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   }
 
   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
-    pgm_active_.Insert(data, thread_id);
+    if constexpr (kUseLippOverlay) {
+      lipp_overlay.Insert(data, thread_id);
+    } else {
+      pgm_active_.Insert(data, thread_id);
+    }
     bloom_active_.add(static_cast<uint64_t>(data.key));
     if (data.key < min_active_) min_active_ = data.key;
     if (data.key > max_active_) max_active_ = data.key;
@@ -487,13 +537,20 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   }
 
   std::vector<std::string> variants() const {
-    return {SearchClass::name(), std::to_string(pgm_error)};
+    std::string label = "e" + std::to_string(pgm_error) + "-s" +
+                        std::to_string(kOwnerMaxSize) + "-f" +
+                        std::to_string(kLocalFlushThreshold);
+    if constexpr (kLookupHeavyLane) {
+      label += "-bf";
+    }
+    return {SearchClass::name(), label};
   }
 
   std::string name() const { return "HybridPGMLippAdv"; }
 
   std::size_t size() const {
     return pgm_active_.size() + pgm_frozen_.size() + lipp.size() +
+           (kUseLippOverlay ? lipp_overlay.size() : 0) +
            bloom_active_.size_in_bytes() + bloom_frozen_.size_in_bytes() +
            prefilter_.size_in_bytes();
   }

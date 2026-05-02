@@ -12,10 +12,10 @@ with highest mean of the three mixed_throughput_mops* columns (README rule).
 from __future__ import annotations
 
 import argparse
+import csv
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import pandas as pd
 
 MIX_COLS = [
     "mixed_throughput_mops1",
@@ -41,17 +41,19 @@ MIXES = [
 ]
 
 
-def best_row_per_index(df: pd.DataFrame) -> dict[str, tuple[float, float]]:
+def best_row_per_index(rows: list[dict[str, str]]) -> dict[str, tuple[float, float]]:
     """index_name -> (mean_throughput, index_size_bytes)."""
     out: dict[str, tuple[float, float]] = {}
     for name in INDEX_ORDER:
-        sub = df[df["index_name"] == name]
-        if sub.empty:
+        sub = [row for row in rows if row["index_name"] == name]
+        if not sub:
             continue
-        means = sub[MIX_COLS].mean(axis=1)
-        best_idx = means.idxmax()
-        row = sub.loc[best_idx]
-        out[name] = (float(means.loc[best_idx]), float(row["index_size_bytes"]))
+        best_row = max(
+            sub,
+            key=lambda row: sum(float(row[col]) for col in MIX_COLS) / len(MIX_COLS),
+        )
+        mean = sum(float(best_row[col]) for col in MIX_COLS) / len(MIX_COLS)
+        out[name] = (mean, float(best_row["index_size_bytes"]))
     return out
 
 
@@ -85,8 +87,9 @@ def main() -> None:
             if not path.is_file():
                 print("skip missing:", path)
                 continue
-            df = pd.read_csv(path)
-            best = best_row_per_index(df)
+            with path.open(newline="") as f:
+                rows = list(csv.DictReader(f))
+            best = best_row_per_index(rows)
             t = {k: best[k][0] for k in best}
             s = {k: best[k][1] for k in best}
             tp = args.out_dir / f"milestone3_{short}_{tag}_throughput.png"

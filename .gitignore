@@ -20,3 +20,4 @@ analysis_results/
 *.png
 # Milestone 3 report figures (override *.png above)
 !report_results/milestone3_good_run/*.png
+!report_results/milestone3_final/*.png

@@ -28,7 +28,7 @@ for DATA in "${DATASETS[@]}"; do
     for INDEX in "${INDEXES[@]}"; do
       echo "=== ${DATA} | ${MIX} | ${INDEX} ==="
       "$BENCHMARK" "./data/${DATA}" "./data/${DATA}_ops_2M_0.000000rq_0.500000nl_${MIX}" \
-        --through --csv --only "$INDEX" -r 3
+        --through --verify --csv --only "$INDEX" -r 3
     done
   done
 done

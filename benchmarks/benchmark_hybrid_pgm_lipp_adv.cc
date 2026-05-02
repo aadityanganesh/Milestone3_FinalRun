@@ -13,17 +13,26 @@ void benchmark_64_hybrid_pgm_lipp_adv(tli::Benchmark<uint64_t>& benchmark, bool 
   } else {
     benchmark.template Run<HybridPGMLippAdv<uint64_t, Searcher, 16>>();
     benchmark.template Run<HybridPGMLippAdv<uint64_t, Searcher, 32>>();
-    benchmark.template Run<HybridPGMLippAdv<uint64_t, Searcher, 64>>();
-    benchmark.template Run<HybridPGMLippAdv<uint64_t, Searcher, 128>>();
     benchmark.template Run<HybridPGMLippAdv<uint64_t, Searcher, 256>>();
-    benchmark.template Run<HybridPGMLippAdv<uint64_t, Searcher, 512>>();
-    benchmark.template Run<HybridPGMLippAdv<uint64_t, Searcher, 1024>>();
   }
 }
 
 template <int record>
 void benchmark_64_hybrid_pgm_lipp_adv(tli::Benchmark<uint64_t>& benchmark,
                                       const std::string& filename) {
+  if (filename.find("mix") != std::string::npos &&
+      filename.find("0.100000i") != std::string::npos) {
+    benchmark.template Run<HybridPGMLippAdv<uint64_t, BranchingBinarySearch<record>, 16>>();
+    benchmark.template Run<HybridPGMLippAdv<uint64_t, BranchingBinarySearch<record>, 32>>();
+    return;
+  }
+
+  if (filename.find("mix") != std::string::npos &&
+      filename.find("0.900000i") != std::string::npos) {
+    benchmark.template Run<HybridPGMLippAdv<uint64_t, BranchingBinarySearch<record>, 256>>();
+    return;
+  }
+
   if (filename.find("books_100M") != std::string::npos) {
     if (filename.find("0.000000i") != std::string::npos) {
       benchmark.template Run<HybridPGMLippAdv<uint64_t, BranchingBinarySearch<record>, 16>>();

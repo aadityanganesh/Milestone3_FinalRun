@@ -100,18 +100,22 @@ static void* DoOpsCoreLoop(void* param) {
 
     switch (op) {
       case util::LOOKUP: {
-        size_t idx = index->EqualityLookup(lo_key, thread_id);
-        asm volatile("" : : "r"(idx));
+        size_t actual_idx = index->EqualityLookup(lo_key, thread_id);
+        asm volatile("" : : "r"(actual_idx));
         if constexpr (time_each) {
           timing_end();
+        }
 
-          if constexpr (verify) {
-            if ((expected == util::NOT_FOUND && idx != util::OVERFLOW) || (expected == 0 && (idx >= keys.size() || keys[idx] != lo_key))){
-              std::cerr << "Lookup returned wrong result:" << std::endl;
-              std::cerr << "Lookup key: " << lo_key << std::endl;
-              std::cerr << "Actual array index: " << idx << ", Expected positive: " << (expected != util::NOT_FOUND) << std::endl;
-              run_failed = true;
-            }
+        if constexpr (verify) {
+          if ((expected == util::NOT_FOUND && actual_idx != util::OVERFLOW) ||
+              (expected == 0 &&
+               (actual_idx >= keys.size() || keys[actual_idx] != lo_key))) {
+            std::cerr << "Lookup returned wrong result:" << std::endl;
+            std::cerr << "Lookup key: " << lo_key << std::endl;
+            std::cerr << "Actual array index: " << actual_idx
+                      << ", Expected positive: "
+                      << (expected != util::NOT_FOUND) << std::endl;
+            run_failed = true;
           }
         }
         break;
@@ -122,14 +126,14 @@ static void* DoOpsCoreLoop(void* param) {
         asm volatile("" : : "r"(actual));
         if constexpr (time_each) {
           timing_end();
+        }
 
-          if constexpr (verify) {
-            if (actual != expected){
-              std::cerr << "Range query returned wrong result:" << std::endl;
-              std::cerr << "Low key: " << lo_key << ", High key: " << hi_key << std::endl;
-              std::cerr << "Actual sum: " << actual << ", Expected sum: " << expected << std::endl;
-              run_failed = true;
-            }
+        if constexpr (verify) {
+          if (actual != expected){
+            std::cerr << "Range query returned wrong result:" << std::endl;
+            std::cerr << "Low key: " << lo_key << ", High key: " << hi_key << std::endl;
+            std::cerr << "Actual sum: " << actual << ", Expected sum: " << expected << std::endl;
+            run_failed = true;
           }
         }
         break;
@@ -355,9 +359,17 @@ class Benchmark {
       // Do operations.
       if (through_) {
         if (fence_) {
-          DoOps<Index, false, true, false, false>(index);
+          if (verify_) {
+            DoOps<Index, false, true, false, true>(index);
+          } else {
+            DoOps<Index, false, true, false, false>(index);
+          }
         } else{
-          DoOps<Index, false, false, false, false>(index);
+          if (verify_) {
+            DoOps<Index, false, false, false, true>(index);
+          } else {
+            DoOps<Index, false, false, false, false>(index);
+          }
         }
       } else if (cold_cache_) {
         if (num_threads_ > 1)
