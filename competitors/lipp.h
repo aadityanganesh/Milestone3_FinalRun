@@ -1,5 +1,7 @@
 #pragma once
 
+#include <limits>
+
 #include "./lipp/src/core/lipp.h"
 #include "base.h"
 
@@ -39,6 +41,33 @@ public:
 
     void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
         lipp_.insert(data.key, data.value);
+    }
+
+    /** Rebuild this LIPP in place from a sorted vector of (key, value) pairs.
+     *  Avoids needing a move-assignment on this wrapper, which is unavailable
+     *  because the underlying LIPP type is not move-assignable. The input
+     *  must be sorted ascending by key (matching bulk_load expectations). */
+    void rebuild_from_sorted_kvs(const std::vector<std::pair<KeyType, uint64_t>>& sorted_kvs) {
+        lipp_.bulk_load(sorted_kvs.data(), static_cast<int>(sorted_kvs.size()));
+    }
+
+    /** In-order walk of every stored key (for maintenance tasks such as Bloom rebuild). */
+    template <class Fn>
+    void for_each_leaf_key(Fn&& fn) const {
+        const KeyType lo = std::numeric_limits<KeyType>::lowest();
+        for (auto it = lipp_.lower_bound(lo); it != lipp_.end(); ++it) {
+            fn(it->comp.data.key);
+        }
+    }
+
+    /** In-order walk of every (key, value) pair (used for periodic LIPP
+     *  bulk-rebuild from current contents). */
+    template <class Fn>
+    void for_each_leaf_kv(Fn&& fn) const {
+        const KeyType lo = std::numeric_limits<KeyType>::lowest();
+        for (auto it = lipp_.lower_bound(lo); it != lipp_.end(); ++it) {
+            fn(it->comp.data.key, it->comp.data.value);
+        }
     }
 
     bool applicable(bool unique, bool range_query, bool insert, bool multithread, const std::string& ops_filename) {
