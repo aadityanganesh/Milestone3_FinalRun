@@ -21,6 +21,74 @@
 #include "fast_membership_filter_uint64.h"
 #include "lipp.h"
 
+class RangeBitmapFilterUint64 {
+ public:
+  void clear() {
+    bits_.clear();
+    min_key_ = 0;
+    max_key_ = 0;
+    shift_ = 0;
+    mask_ = 0;
+  }
+
+  template <class KeyValueVec>
+  void init(const KeyValueVec& data, size_t log2_buckets) {
+    clear();
+    if (data.empty()) return;
+    min_key_ = static_cast<uint64_t>(data.front().key);
+    max_key_ = static_cast<uint64_t>(data.front().key);
+    for (const auto& kv : data) {
+      const uint64_t key = static_cast<uint64_t>(kv.key);
+      if (key < min_key_) min_key_ = key;
+      if (key > max_key_) max_key_ = key;
+    }
+
+    const size_t buckets = size_t{1} << log2_buckets;
+    mask_ = buckets - 1;
+    bits_.assign((buckets + 63) >> 6, 0ULL);
+
+    const uint64_t range = max_key_ - min_key_;
+    size_t range_bits = 0;
+    uint64_t tmp = range;
+    while (tmp > 0) {
+      ++range_bits;
+      tmp >>= 1;
+    }
+    shift_ = range_bits > log2_buckets ? range_bits - log2_buckets : 0;
+
+    for (const auto& kv : data) {
+      add(static_cast<uint64_t>(kv.key));
+    }
+  }
+
+  void add(uint64_t key) {
+    if (bits_.empty()) return;
+    if (key < min_key_ || key > max_key_) return;
+    const size_t bit = bucket(key);
+    bits_[bit >> 6] |= 1ULL << (bit & 63);
+  }
+
+  bool maybe_contains(uint64_t key) const {
+    if (bits_.empty()) return true;
+    if (key < min_key_ || key > max_key_) return true;
+    const size_t bit = bucket(key);
+    return (bits_[bit >> 6] & (1ULL << (bit & 63))) != 0;
+  }
+
+  size_t size_in_bytes() const { return bits_.size() * sizeof(uint64_t); }
+
+ private:
+  size_t bucket(uint64_t key) const {
+    return static_cast<size_t>(((key - min_key_) >> shift_) & mask_);
+  }
+
+  std::vector<uint64_t> bits_;
+  uint64_t min_key_ = 0;
+  uint64_t max_key_ = 0;
+  size_t shift_ = 0;
+  size_t mask_ = 0;
+};
+
 /**
  * Milestone 3 hybrid (Stage 5). Pure DPGM + LIPP design with Bloom-style side
  * filters (bits only) and an asynchronous background drain into LIPP.
@@ -126,7 +194,11 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   static constexpr double kInsertHeavyThresholdPct = 0.50;
   static constexpr size_t kLookupHeavyActiveCap = kActiveCapDefault;
   static constexpr bool kLookupHeavyLane = pgm_error <= 64;
-  static constexpr bool kUseLippOverlay = kLookupHeavyLane;
+  static constexpr bool kDirectLippLookupHeavy = false;
+  static constexpr bool kUseLippOverlay = false;
+  static constexpr bool kUseRangeBaseFilter = kLookupHeavyLane;
+  static constexpr bool kUseBaseFilter = !kUseRangeBaseFilter && kEnablePrefilter;
+  static constexpr size_t kRangeFilterLog2Buckets = 27;
   mutable size_t warmup_ops_ = 0;
   mutable size_t warmup_inserts_ = 0;
   mutable Mode mode_ = Mode::kUnknown;
@@ -150,6 +222,7 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   size_t frozen_drain_cursor_ = 0;
 
   FastMembershipFilterUint64 prefilter_;
+  RangeBitmapFilterUint64 range_prefilter_;
 
   size_t drains_since_rebuild_ = 0;
 
@@ -405,7 +478,10 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     warmup_inserts_ = 0;
 
     prefilter_.clear();
-    if (kEnablePrefilter) {
+    range_prefilter_.clear();
+    if constexpr (kUseRangeBaseFilter) {
+      range_prefilter_.init(data, kRangeFilterLog2Buckets);
+    } else if constexpr (kUseBaseFilter) {
       prefilter_.init(prefilter_capacity(total_size_), kBaseFilterBitsPerKey);
       for (const auto& kv : data) {
         prefilter_.add(static_cast<uint64_t>(kv.key));
@@ -430,11 +506,14 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     if (mode_ == Mode::kUnknown) {
       ++warmup_ops_;
     }
-    // Both lanes use the bulk-loaded LIPP as the fast base path. The optional
-    // base-membership prefilter is left disabled in the final packaged run
-    // because it was slower than a direct LIPP probe on these traces.
+    // Both lanes use the bulk-loaded LIPP as the fast base path. The
+    // lookup-heavy lane adds a metadata-only base membership filter so true
+    // negative lookups skip expensive LIPP misses.
     bool maybe_in_base = true;
-    if constexpr (kEnablePrefilter) {
+    if constexpr (kUseRangeBaseFilter) {
+      maybe_in_base =
+          range_prefilter_.maybe_contains(static_cast<uint64_t>(lookup_key));
+    } else if constexpr (kUseBaseFilter) {
       maybe_in_base = prefilter_.maybe_contains(static_cast<uint64_t>(lookup_key));
     }
     if (maybe_in_base) {
@@ -493,7 +572,12 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   }
 
   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
-    if constexpr (kUseLippOverlay) {
+    if constexpr (kDirectLippLookupHeavy) {
+      lipp.Insert(data, thread_id);
+      range_prefilter_.add(static_cast<uint64_t>(data.key));
+      ++total_size_;
+      return;
+    } else if constexpr (kUseLippOverlay) {
       lipp_overlay.Insert(data, thread_id);
     } else {
       pgm_active_.Insert(data, thread_id);
@@ -552,7 +636,7 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     return pgm_active_.size() + pgm_frozen_.size() + lipp.size() +
            (kUseLippOverlay ? lipp_overlay.size() : 0) +
            bloom_active_.size_in_bytes() + bloom_frozen_.size_in_bytes() +
-           prefilter_.size_in_bytes();
+           prefilter_.size_in_bytes() + range_prefilter_.size_in_bytes();
   }
 };
 
