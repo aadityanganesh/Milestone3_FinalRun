@@ -8,8 +8,6 @@ push to GitHub.
 | Path | Description |
 |------|-------------|
 | `milestone3_final/` | Final report, final-winner CSV, and the final bar charts |
-| `milestone3_good_run/` | Earlier good-run bar charts and summary tables |
-| `plot_milestone3_good_run.py` | Regenerates the good-run plots |
 | `../scripts/plot_milestone3_mix.py` | Regenerates the final plots from benchmark CSVs in `results/` |
 
 ## Regenerate Final Plots
