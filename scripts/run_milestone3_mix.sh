@@ -4,9 +4,26 @@
 # Run from repo root after build. Uses -r 3 per README.
 set -euo pipefail
 
+if [[ "${MILESTONE3_SKIP_MODULE_LOAD:-0}" != "1" ]]; then
+  if ! command -v module >/dev/null 2>&1; then
+    [[ -f /etc/profile.d/modules.sh ]] && source /etc/profile.d/modules.sh
+  fi
+  if command -v module >/dev/null 2>&1; then
+    module load gcc/11 boost/1.85.0 >/dev/null 2>&1 || true
+  fi
+fi
+
 BENCHMARK="${BENCHMARK:-build/benchmark}"
 if [[ ! -f "$BENCHMARK" ]]; then
   echo "benchmark binary missing at ${BENCHMARK}; run scripts/build_benchmark.sh first"
+  exit 1
+fi
+
+MISSING_LIBS="$(ldd "$BENCHMARK" 2>/dev/null | grep "not found" || true)"
+if [[ -n "$MISSING_LIBS" ]]; then
+  echo "benchmark binary has missing shared libraries:"
+  echo "$MISSING_LIBS"
+  echo "Try: module load gcc/11 boost/1.85.0"
   exit 1
 fi
 
