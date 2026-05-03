@@ -15,9 +15,16 @@ rmi.tar.zst
 benchmark_results_*
 fb*.csv
 results/
+!results/
+results/*
+!results/*_ops_2M_0.000000rq_0.500000nl_0.100000i_0m_mix_results_table.csv
+!results/*_ops_2M_0.000000rq_0.500000nl_0.900000i_0m_mix_results_table.csv
 
 analysis_results/
 *.png
 # Milestone 3 report figures (override *.png above)
 !report_results/milestone3_good_run/*.png
 !report_results/milestone3_final/*.png
+
+slurm-*.out
+milestone3_push_bundle/

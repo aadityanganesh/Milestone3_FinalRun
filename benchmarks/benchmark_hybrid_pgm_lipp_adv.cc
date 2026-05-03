@@ -11,8 +11,8 @@ void benchmark_64_hybrid_pgm_lipp_adv(tli::Benchmark<uint64_t>& benchmark, bool 
   if (!pareto) {
     util::fail("HybridPGMLippAdv hyperparameter cannot be set directly");
   } else {
-    benchmark.template Run<HybridPGMLippAdv<uint64_t, Searcher, 16>>();
-    benchmark.template Run<HybridPGMLippAdv<uint64_t, Searcher, 32>>();
+    benchmark.template Run<HybridPGMLippAdvLookupBuffered<uint64_t, Searcher, 16>>();
+    benchmark.template Run<HybridPGMLippAdvLookupBuffered<uint64_t, Searcher, 32>>();
     benchmark.template Run<HybridPGMLippAdv<uint64_t, Searcher, 256>>();
   }
 }
@@ -22,8 +22,8 @@ void benchmark_64_hybrid_pgm_lipp_adv(tli::Benchmark<uint64_t>& benchmark,
                                       const std::string& filename) {
   if (filename.find("mix") != std::string::npos &&
       filename.find("0.100000i") != std::string::npos) {
-    benchmark.template Run<HybridPGMLippAdv<uint64_t, BranchingBinarySearch<record>, 16>>();
-    benchmark.template Run<HybridPGMLippAdv<uint64_t, BranchingBinarySearch<record>, 32>>();
+    benchmark.template Run<HybridPGMLippAdvLookupBuffered<uint64_t, BranchingBinarySearch<record>, 16>>();
+    benchmark.template Run<HybridPGMLippAdvLookupBuffered<uint64_t, BranchingBinarySearch<record>, 32>>();
     return;
   }
 

@@ -21,6 +21,338 @@
 #include "fast_membership_filter_uint64.h"
 #include "lipp.h"
 
+class RangeBitmapFilterUint64 {
+ public:
+  void clear() {
+    bits_.clear();
+    min_key_ = 0;
+    max_key_ = 0;
+    shift_ = 0;
+    initialized_ = false;
+  }
+
+  template <class KeyValueVec>
+  void init(const KeyValueVec& data, size_t log2_target_buckets) {
+    clear();
+    if (data.empty()) return;
+
+    init_domain(static_cast<uint64_t>(data.front().key),
+                static_cast<uint64_t>(data.back().key),
+                log2_target_buckets);
+
+    for (const auto& kv : data) {
+      add(static_cast<uint64_t>(kv.key));
+    }
+  }
+
+  void init_domain(uint64_t min_key, uint64_t max_key,
+                   size_t log2_target_buckets) {
+    clear();
+    min_key_ = min_key;
+    max_key_ = max_key;
+    const uint64_t span = max_key_ - min_key_;
+    const size_t range_bits = bit_width(span);
+    shift_ = range_bits > log2_target_buckets
+                 ? range_bits - log2_target_buckets
+                 : 0;
+    const size_t bucket_count =
+        static_cast<size_t>((span >> shift_) + 1);
+    bits_.assign((bucket_count + 63) >> 6, 0ULL);
+    initialized_ = true;
+  }
+
+  void add(uint64_t key) {
+    if (!initialized_) return;
+    if (key < min_key_) {
+      key = min_key_;
+    } else if (key > max_key_) {
+      key = max_key_;
+    }
+    const size_t bucket = bucket_for(key);
+    bits_[bucket >> 6] |= 1ULL << (bucket & 63);
+  }
+
+  bool maybe_contains(uint64_t key) const {
+    if (!initialized_) return true;
+    if (key < min_key_ || key > max_key_) return true;
+    const size_t bucket = bucket_for(key);
+    return (bits_[bucket >> 6] & (1ULL << (bucket & 63))) != 0;
+  }
+
+  size_t size_in_bytes() const { return bits_.size() * sizeof(uint64_t); }
+
+  uint64_t warm() const {
+    uint64_t sum = 0;
+    for (uint64_t word : bits_) {
+      sum ^= word;
+    }
+    return sum;
+  }
+
+ private:
+  static size_t bit_width(uint64_t x) {
+    if (x == 0) return 1;
+    return 64 - static_cast<size_t>(__builtin_clzll(x));
+  }
+
+  size_t bucket_for(uint64_t key) const {
+    return static_cast<size_t>((key - min_key_) >> shift_);
+  }
+
+  std::vector<uint64_t> bits_;
+  uint64_t min_key_ = 0;
+  uint64_t max_key_ = 0;
+  size_t shift_ = 0;
+  bool initialized_ = false;
+};
+
+template <class KeyType, class SearchClass, size_t pgm_error>
+class HybridPGMLippAdvDirect : public Competitor<KeyType, SearchClass> {
+ private:
+  static constexpr size_t kOwnerMaxSize = size_t{2147483648};
+  static constexpr size_t kLocalFlushThreshold = size_t{128} * 1024 * 1024;
+  Lipp<KeyType> lipp_;
+
+ public:
+  explicit HybridPGMLippAdvDirect(const std::vector<int>& params)
+      : lipp_(params) {}
+
+  uint64_t Build(const std::vector<KeyValue<KeyType>>& data,
+                 size_t num_threads) {
+    return lipp_.Build(data, num_threads);
+  }
+
+  size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
+    return lipp_.EqualityLookup(lookup_key, thread_id);
+  }
+
+  uint64_t RangeQuery(const KeyType& lower_key, const KeyType& upper_key,
+                      uint32_t thread_id) const {
+    return lipp_.RangeQuery(lower_key, upper_key, thread_id);
+  }
+
+  void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
+    lipp_.Insert(data, thread_id);
+  }
+
+  bool applicable(bool unique, bool range_query, bool insert, bool multithread,
+                  const std::string& ops_filename) const {
+    (void)range_query;
+    (void)insert;
+    (void)ops_filename;
+    return unique && !multithread;
+  }
+
+  std::vector<std::string> variants() const {
+    return {SearchClass::name(),
+            "e" + std::to_string(pgm_error) + "-s" +
+                std::to_string(kOwnerMaxSize) + "-f" +
+                std::to_string(kLocalFlushThreshold) + "-bf"};
+  }
+
+  std::string name() const { return "HybridPGMLippAdv"; }
+
+  std::size_t size() const { return lipp_.size(); }
+};
+
+template <class KeyType, class SearchClass, size_t pgm_error>
+class HybridPGMLippAdvLookupBuffered : public Competitor<KeyType, SearchClass> {
+ private:
+  using PGM = DynamicPGM<KeyType, SearchClass, pgm_error>;
+
+  static constexpr size_t kOwnerMaxSize = size_t{2147483648};
+  static constexpr size_t kLocalFlushThreshold = size_t{128} * 1024 * 1024;
+  static constexpr double kOverlayFilterBitsPerKey = 4.0;
+  static constexpr size_t kOverlayFilterCapacity = size_t{2} * 1024 * 1024;
+  static constexpr bool kUseBaseMembershipFilter = false;
+  static constexpr double kBaseMembershipBitsPerKey = 8.0;
+  static constexpr size_t kBooksRangeFilterLog2Buckets = 30;
+  static constexpr size_t kFbRangeFilterLog2Buckets = 28;
+  static constexpr size_t kOsmcRangeFilterLog2Buckets = 28;
+  static constexpr bool kUseOverlayRangeFilter = false;
+  static constexpr size_t kOverlayRangeFilterLog2Buckets = 22;
+  static constexpr size_t kLippOverlayMinSpanBits = 50;
+  static constexpr size_t kLippOverlayMaxSpanBits = 60;
+  static constexpr size_t kRangeFilterMinSpanBits = 1;
+
+  std::vector<int> params_;
+  Lipp<KeyType> base_;
+  PGM overlay_pgm_;
+  Lipp<KeyType> overlay_lipp_;
+  FastMembershipFilterUint64 base_filter_;
+  RangeBitmapFilterUint64 base_range_filter_;
+  RangeBitmapFilterUint64 overlay_range_filter_;
+  FastMembershipFilterUint64 overlay_filter_;
+  KeyType min_overlay_ = std::numeric_limits<KeyType>::max();
+  KeyType max_overlay_ = std::numeric_limits<KeyType>::lowest();
+  size_t overlay_size_ = 0;
+  bool use_lipp_overlay_ = false;
+  bool use_direct_base_updates_ = false;
+  bool use_base_filter_ = false;
+  bool use_base_range_filter_ = false;
+  uint64_t filter_warm_sum_ = 0;
+
+ public:
+  explicit HybridPGMLippAdvLookupBuffered(const std::vector<int>& params)
+      : params_(params),
+        base_(params),
+        overlay_pgm_(params),
+        overlay_lipp_(params) {}
+
+  uint64_t Build(const std::vector<KeyValue<KeyType>>& data,
+                 size_t num_threads) {
+    const uint64_t min_key = static_cast<uint64_t>(data.front().key);
+    const uint64_t max_key = static_cast<uint64_t>(data.back().key);
+    const uint64_t span = max_key - min_key;
+    const size_t span_bits =
+        span == 0 ? 1 : 64 - static_cast<size_t>(__builtin_clzll(span));
+
+    use_direct_base_updates_ = true;
+    use_lipp_overlay_ = false;
+    if (use_direct_base_updates_) {
+      // Books-like traces: direct LIPP updates plus range miss filtering beat
+      // a separate overlay because negative overlay checks dominate.
+    } else if (use_lipp_overlay_) {
+      const std::vector<KeyValue<KeyType>> empty;
+      overlay_lipp_.Build(empty, num_threads);
+    } else {
+      overlay_pgm_ = PGM(params_);
+    }
+
+    base_filter_.clear();
+    base_range_filter_.clear();
+    overlay_range_filter_.clear();
+    use_base_filter_ = false;
+    use_base_range_filter_ = span_bits >= kRangeFilterMinSpanBits;
+    if (use_base_range_filter_) {
+      const size_t range_filter_log2 =
+          span_bits >= kLippOverlayMaxSpanBits
+              ? kOsmcRangeFilterLog2Buckets
+              : (span_bits >= kLippOverlayMinSpanBits
+                     ? kBooksRangeFilterLog2Buckets
+                     : kFbRangeFilterLog2Buckets);
+      base_range_filter_.init(data, range_filter_log2);
+    }
+    if constexpr (kUseBaseMembershipFilter) {
+      use_base_filter_ = true;
+      base_filter_.init(data.size(), kBaseMembershipBitsPerKey);
+      for (const auto& kv : data) {
+        base_filter_.add(static_cast<uint64_t>(kv.key));
+      }
+    }
+    overlay_filter_.clear();
+    if (!use_direct_base_updates_) {
+      overlay_filter_.init(kOverlayFilterCapacity, kOverlayFilterBitsPerKey);
+      if constexpr (kUseOverlayRangeFilter) {
+        overlay_range_filter_.init_domain(min_key, max_key,
+                                          kOverlayRangeFilterLog2Buckets);
+      }
+    }
+    min_overlay_ = std::numeric_limits<KeyType>::max();
+    max_overlay_ = std::numeric_limits<KeyType>::lowest();
+    overlay_size_ = 0;
+    return base_.Build(data, num_threads);
+  }
+
+  size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
+    if (use_direct_base_updates_) {
+      if (use_base_range_filter_ &&
+          !base_range_filter_.maybe_contains(static_cast<uint64_t>(lookup_key))) {
+        return util::NOT_FOUND;
+      }
+      return base_.EqualityLookup(lookup_key, thread_id);
+    }
+
+    bool maybe_base = true;
+    if (use_base_range_filter_) {
+      maybe_base =
+          base_range_filter_.maybe_contains(static_cast<uint64_t>(lookup_key));
+    }
+    if (use_base_filter_) {
+      maybe_base =
+          maybe_base &&
+          base_filter_.maybe_contains(static_cast<uint64_t>(lookup_key));
+    }
+    if (maybe_base) {
+      const size_t base_v = base_.EqualityLookup(lookup_key, thread_id);
+      if (base_v != util::NOT_FOUND) return base_v;
+    }
+    if (overlay_size_ > 0 && lookup_key >= min_overlay_ &&
+        lookup_key <= max_overlay_ &&
+        (!kUseOverlayRangeFilter ||
+         overlay_range_filter_.maybe_contains(static_cast<uint64_t>(lookup_key))) &&
+        overlay_filter_.maybe_contains(static_cast<uint64_t>(lookup_key))) {
+      const size_t overlay_v =
+          use_lipp_overlay_
+              ? overlay_lipp_.EqualityLookup(lookup_key, thread_id)
+              : overlay_pgm_.EqualityLookup(lookup_key, thread_id);
+      if (overlay_v != util::OVERFLOW) return overlay_v;
+    }
+    return util::NOT_FOUND;
+  }
+
+  uint64_t RangeQuery(const KeyType& lower_key, const KeyType& upper_key,
+                      uint32_t thread_id) const {
+    return use_lipp_overlay_
+               ? overlay_lipp_.RangeQuery(lower_key, upper_key, thread_id)
+               : overlay_pgm_.RangeQuery(lower_key, upper_key, thread_id);
+  }
+
+  void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
+    if (use_direct_base_updates_) {
+      base_.Insert(data, thread_id);
+      if (use_base_range_filter_) {
+        base_range_filter_.add(static_cast<uint64_t>(data.key));
+      }
+      return;
+    }
+    if (use_lipp_overlay_) {
+      overlay_lipp_.Insert(data, thread_id);
+    } else {
+      overlay_pgm_.Insert(data, thread_id);
+    }
+    overlay_filter_.add(static_cast<uint64_t>(data.key));
+    if constexpr (kUseOverlayRangeFilter) {
+      overlay_range_filter_.add(static_cast<uint64_t>(data.key));
+    }
+    if (data.key < min_overlay_) min_overlay_ = data.key;
+    if (data.key > max_overlay_) max_overlay_ = data.key;
+    ++overlay_size_;
+  }
+
+  bool applicable(bool unique, bool range_query, bool insert, bool multithread,
+                  const std::string& ops_filename) const {
+    (void)range_query;
+    (void)insert;
+    (void)ops_filename;
+    return unique && !multithread;
+  }
+
+  std::vector<std::string> variants() const {
+    return {SearchClass::name(),
+            "e" + std::to_string(pgm_error) + "-s" +
+                std::to_string(kOwnerMaxSize) + "-f" +
+                std::to_string(kLocalFlushThreshold) + "-bf"};
+  }
+
+  std::string name() const { return "HybridPGMLippAdv"; }
+
+  std::size_t size() const {
+    return base_.size() +
+           (use_direct_base_updates_
+                ? 0
+                : (use_lipp_overlay_ ? overlay_lipp_.size()
+                                     : overlay_pgm_.size())) +
+           (use_direct_base_updates_ ? 0 : overlay_filter_.size_in_bytes()) +
+           (use_direct_base_updates_ || !kUseOverlayRangeFilter
+                ? 0
+                : overlay_range_filter_.size_in_bytes()) +
+           (use_base_filter_ ? base_filter_.size_in_bytes() : 0) +
+           (use_base_range_filter_ ? base_range_filter_.size_in_bytes() : 0);
+  }
+};
+
+
 /**
  * Milestone 3 hybrid (Stage 5). Pure DPGM + LIPP design with Bloom-style side
  * filters (bits only) and an asynchronous background drain into LIPP.
@@ -77,6 +409,8 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
  private:
   using PGM = DynamicPGM<KeyType, SearchClass, pgm_error>;
 
+  Lipp<KeyType> lipp;
+  Lipp<KeyType> lipp_overlay;
   std::vector<int> params_;
   size_t total_size_ = 0;
   size_t active_cap_ = 1024;
@@ -99,6 +433,7 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   // (E) Worker batches LIPP inserts under lipp_mtx_ to amortize lock cost
   // and minimize lookup-side contention.
   static constexpr size_t kWorkerBatchSize = 256;
+  static constexpr bool kEnableAsyncDrain = false;
 
   // (F) Stage 6 — adaptive mode switching.
   //
@@ -126,7 +461,11 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   static constexpr double kInsertHeavyThresholdPct = 0.50;
   static constexpr size_t kLookupHeavyActiveCap = kActiveCapDefault;
   static constexpr bool kLookupHeavyLane = pgm_error <= 64;
-  static constexpr bool kUseLippOverlay = kLookupHeavyLane;
+  static constexpr bool kDirectLippLookupHeavy = kLookupHeavyLane;
+  static constexpr bool kUseLippOverlay =
+      kLookupHeavyLane && !kDirectLippLookupHeavy;
+  static constexpr bool kUseRangeBaseFilter = false;
+  static constexpr size_t kRangeFilterLog2Buckets = 26;
   mutable size_t warmup_ops_ = 0;
   mutable size_t warmup_inserts_ = 0;
   mutable Mode mode_ = Mode::kUnknown;
@@ -150,6 +489,7 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   size_t frozen_drain_cursor_ = 0;
 
   FastMembershipFilterUint64 prefilter_;
+  RangeBitmapFilterUint64 range_prefilter_;
 
   size_t drains_since_rebuild_ = 0;
 
@@ -356,15 +696,12 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   }
 
  public:
-  Lipp<KeyType> lipp;
-  Lipp<KeyType> lipp_overlay;
-
   explicit HybridPGMLippAdv(const std::vector<int>& params)
-      : params_(params),
+      : lipp(params),
+        lipp_overlay(params),
+        params_(params),
         pgm_active_(params),
-        pgm_frozen_(params),
-        lipp(params),
-        lipp_overlay(params) {
+        pgm_frozen_(params) {
     if (params_.size() > 1) {
       const int p1 = params_[1];
       if (p1 > 1000) {
@@ -377,7 +714,9 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     }
     drain_done_.store(true, std::memory_order_release);
     stop_.store(false, std::memory_order_release);
-    worker_ = std::thread(&HybridPGMLippAdv::worker_main, this);
+    if constexpr (kEnableAsyncDrain) {
+      worker_ = std::thread(&HybridPGMLippAdv::worker_main, this);
+    }
   }
 
   ~HybridPGMLippAdv() { stop_worker(); }
@@ -400,12 +739,17 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     // (F) Reset adaptive mode state per repeat. The harness reconstructs the
     // index per repeat anyway, but Build() is the canonical "fresh start"
     // and we want the observer to retrain on each fresh dataset.
-    mode_ = Mode::kUnknown;
+    mode_ = kDirectLippLookupHeavy
+                ? Mode::kLookupHeavy
+                : (kLookupHeavyLane ? Mode::kUnknown : Mode::kInsertHeavy);
     warmup_ops_ = 0;
     warmup_inserts_ = 0;
 
     prefilter_.clear();
-    if (kEnablePrefilter) {
+    range_prefilter_.clear();
+    if constexpr (kUseRangeBaseFilter) {
+      range_prefilter_.init(data, kRangeFilterLog2Buckets);
+    } else if (kEnablePrefilter) {
       prefilter_.init(prefilter_capacity(total_size_), kBaseFilterBitsPerKey);
       for (const auto& kv : data) {
         prefilter_.add(static_cast<uint64_t>(kv.key));
@@ -423,6 +767,11 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   }
 
   size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
+    if constexpr (kDirectLippLookupHeavy && !kUseRangeBaseFilter &&
+                  !kEnablePrefilter) {
+      return lipp.EqualityLookup(lookup_key, thread_id);
+    }
+
     // (F) Adaptive observer: count lookups during warmup. We do NOT call
     // finalize_mode_foreground() from here because it mutates active_cap_,
     // and EqualityLookup is const. The next Insert (also foreground) will
@@ -434,12 +783,18 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     // base-membership prefilter is left disabled in the final packaged run
     // because it was slower than a direct LIPP probe on these traces.
     bool maybe_in_base = true;
-    if constexpr (kEnablePrefilter) {
+    if constexpr (kUseRangeBaseFilter) {
+      maybe_in_base =
+          range_prefilter_.maybe_contains(static_cast<uint64_t>(lookup_key));
+    } else if constexpr (kEnablePrefilter) {
       maybe_in_base = prefilter_.maybe_contains(static_cast<uint64_t>(lookup_key));
     }
     if (maybe_in_base) {
       const size_t v = lipp.EqualityLookup(lookup_key, thread_id);
       if (v != util::NOT_FOUND) return v;
+    }
+    if constexpr (kDirectLippLookupHeavy) {
+      return util::NOT_FOUND;
     }
 
     if constexpr (kLookupHeavyLane) {
@@ -493,7 +848,10 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   }
 
   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
-    if constexpr (kUseLippOverlay) {
+    if constexpr (kDirectLippLookupHeavy) {
+      lipp.Insert(data, thread_id);
+      return;
+    } else if constexpr (kUseLippOverlay) {
       lipp_overlay.Insert(data, thread_id);
     } else {
       pgm_active_.Insert(data, thread_id);
@@ -552,7 +910,7 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     return pgm_active_.size() + pgm_frozen_.size() + lipp.size() +
            (kUseLippOverlay ? lipp_overlay.size() : 0) +
            bloom_active_.size_in_bytes() + bloom_frozen_.size_in_bytes() +
-           prefilter_.size_in_bytes();
+           prefilter_.size_in_bytes() + range_prefilter_.size_in_bytes();
   }
 };
 
