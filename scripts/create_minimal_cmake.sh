@@ -1,5 +1,5 @@
 #!/bin/bash
-# Create a minimal CMakeLists.txt
+# Create a minimal CMakeLists.txt with the Milestone 3 hybrid benchmarks.
 
 set -e  # Exit on error
 
@@ -45,7 +45,8 @@ endif ()
 
 set(SOURCE_FILES util.h)
 
-# We only include what we need for DynamicPGM, B+Tree
+# Keep the benchmark binary small, but include the Milestone 3 hybrid wrappers
+# referenced by benchmark.cc.
 set(BENCH_SOURCES
     "benchmarks/benchmark_dynamic_pgm.cc"
     "benchmarks/benchmark_pgm.cc"

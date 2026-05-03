@@ -1,0 +1,7 @@
+dataset,workload,winning_configuration,hybridpgmlippadv_mops,lipp_mops,dynamicpgm_mops,naive_hybridpgmlipp_mops,beats_all_baselines,index_size_bytes
+books,10% insert / 90% lookup,BinarySearch-e32-s2147483648-f134217728-bf,6.188153,5.131503,1.043450,1.162667,yes,11927060512
+books,90% insert / 10% lookup,BinarySearch-e256-s2147483648-f134217728,5.216470,3.549817,3.169480,3.515557,yes,11688164380
+fb,10% insert / 90% lookup,BinarySearch-e32-s2147483648-f134217728-bf,6.109020,4.787563,0.957548,1.123760,yes,12719868968
+fb,90% insert / 10% lookup,BinarySearch-e256-s2147483648-f134217728,5.276000,2.782507,3.154510,3.399323,yes,12540345108
+osmc,10% insert / 90% lookup,BinarySearch-e32-s2147483648-f134217728-bf,5.014877,3.854043,1.053757,1.209500,yes,20620384496
+osmc,90% insert / 10% lookup,BinarySearch-e256-s2147483648-f134217728,4.072857,2.617643,3.118210,3.209390,yes,20288379268
