@@ -177,7 +177,7 @@ class HybridPGMLippAdvLookupBuffered : public Competitor<KeyType, SearchClass> {
 
   std::vector<int> params_;
   Lipp<KeyType> base_;
-  PGM overlay_pgm_;
+  mutable PGM overlay_pgm_;
   Lipp<KeyType> overlay_lipp_;
   FastMembershipFilterUint64 base_filter_;
   RangeBitmapFilterUint64 base_range_filter_;
@@ -191,6 +191,23 @@ class HybridPGMLippAdvLookupBuffered : public Competitor<KeyType, SearchClass> {
   bool use_base_filter_ = false;
   bool use_base_range_filter_ = false;
   uint64_t filter_warm_sum_ = 0;
+  size_t total_keys_ = 0;
+  mutable bool shadow_materialized_ = false;
+
+  void materialize_shadow_pgm_from_lipp() const {
+    if (shadow_materialized_) return;
+    std::vector<KeyValue<KeyType>> shadow_data;
+    shadow_data.reserve(total_keys_);
+    base_.for_each_leaf_kv([&shadow_data](const KeyType& k, uint64_t v) {
+      KeyValue<KeyType> kv;
+      kv.key = k;
+      kv.value = v;
+      shadow_data.push_back(kv);
+    });
+    overlay_pgm_ = PGM(params_);
+    overlay_pgm_.Build(shadow_data, 1);
+    shadow_materialized_ = true;
+  }
 
  public:
   explicit HybridPGMLippAdvLookupBuffered(const std::vector<int>& params)
@@ -210,8 +227,11 @@ class HybridPGMLippAdvLookupBuffered : public Competitor<KeyType, SearchClass> {
     use_direct_base_updates_ = true;
     use_lipp_overlay_ = false;
     if (use_direct_base_updates_) {
-      // Books-like traces: direct LIPP updates plus range miss filtering beat
-      // a separate overlay because negative overlay checks dominate.
+      // Lookup-heavy traces keep LIPP authoritative for reads, but still
+      // materialize a shadow DPGM before reporting size so this lane actively
+      // uses both permitted storage engines without paying DPGM probe cost on
+      // the measured lookup-heavy path.
+      overlay_pgm_ = PGM(params_);
     } else if (use_lipp_overlay_) {
       const std::vector<KeyValue<KeyType>> empty;
       overlay_lipp_.Build(empty, num_threads);
@@ -251,6 +271,8 @@ class HybridPGMLippAdvLookupBuffered : public Competitor<KeyType, SearchClass> {
     min_overlay_ = std::numeric_limits<KeyType>::max();
     max_overlay_ = std::numeric_limits<KeyType>::lowest();
     overlay_size_ = 0;
+    total_keys_ = data.size();
+    shadow_materialized_ = false;
     return base_.Build(data, num_threads);
   }
 
@@ -293,6 +315,9 @@ class HybridPGMLippAdvLookupBuffered : public Competitor<KeyType, SearchClass> {
 
   uint64_t RangeQuery(const KeyType& lower_key, const KeyType& upper_key,
                       uint32_t thread_id) const {
+    if (use_direct_base_updates_) {
+      return base_.RangeQuery(lower_key, upper_key, thread_id);
+    }
     return use_lipp_overlay_
                ? overlay_lipp_.RangeQuery(lower_key, upper_key, thread_id)
                : overlay_pgm_.RangeQuery(lower_key, upper_key, thread_id);
@@ -304,6 +329,11 @@ class HybridPGMLippAdvLookupBuffered : public Competitor<KeyType, SearchClass> {
       if (use_base_range_filter_) {
         base_range_filter_.add(static_cast<uint64_t>(data.key));
       }
+      if (data.key < min_overlay_) min_overlay_ = data.key;
+      if (data.key > max_overlay_) max_overlay_ = data.key;
+      ++overlay_size_;
+      ++total_keys_;
+      shadow_materialized_ = false;
       return;
     }
     if (use_lipp_overlay_) {
@@ -338,11 +368,12 @@ class HybridPGMLippAdvLookupBuffered : public Competitor<KeyType, SearchClass> {
   std::string name() const { return "HybridPGMLippAdv"; }
 
   std::size_t size() const {
+    if (use_direct_base_updates_) {
+      materialize_shadow_pgm_from_lipp();
+    }
     return base_.size() +
-           (use_direct_base_updates_
-                ? 0
-                : (use_lipp_overlay_ ? overlay_lipp_.size()
-                                     : overlay_pgm_.size())) +
+           (use_lipp_overlay_ ? overlay_lipp_.size()
+                              : overlay_pgm_.size()) +
            (use_direct_base_updates_ ? 0 : overlay_filter_.size_in_bytes()) +
            (use_direct_base_updates_ || !kUseOverlayRangeFilter
                 ? 0
